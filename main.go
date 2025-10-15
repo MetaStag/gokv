@@ -1,21 +1,89 @@
 package main
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"time"
 
 	badger "github.com/dgraph-io/badger/v4"
 )
 
-// In-memory map for fast access
-// potential issue: too much data will overload memory
 var (
-	db *badger.DB
-	mp map[string]string
-	mutex sync.RWMutex
+	db    *badger.DB        // database object
+	lsn   int               // keep track of log file entries
+	mp    map[string]string // In-memory map for fast access
+	mutex sync.RWMutex      // manage access to shared resources
 )
+
+// Check if important file/folders exist, if not then create them
+// Future scalability: represent the files/folders in an array, to reduce code
+func ValidateFiles() bool {
+	_, err := os.Stat("wal.log")
+	if os.IsNotExist(err) {
+		log.Println("Log file does not exist, creating one")
+		file, err := os.Create("wal.log")
+		if err != nil {
+			log.Println("Could not create log file - ", err)
+			return false
+		}
+		file.Close()
+	}
+	_, err = os.Stat("checkpoint.txt")
+	if os.IsNotExist(err) {
+		log.Println("Checkpoint file does not exist, creating one")
+		file, err := os.Create("checkpoint.txt")
+		file.WriteString("0")
+		if err != nil {
+			log.Println("Could not create checkpoint file - ", err)
+			return false
+		}
+		file.Close()
+	}
+	_, err = os.Stat("./db")
+	if os.IsNotExist(err) {
+		log.Println("Database folder does not exist, creating one")
+		err = os.Mkdir("./db", 0600)
+		if err != nil {
+			log.Println("Could not create db folder - ", err)
+			return false
+		}
+	}
+	return true
+}
+
+// Load the number of log entries for checkpoint purpose
+func LoadLSN() (int, error) {
+	file, err := os.Open("wal.log")
+	if err != nil {
+		return 0, err
+	}
+	defer file.Close()
+
+	buf := make([]byte, 32*1024) // make a 32kb buffer
+	count := 0
+
+	// Read the file in chunks and count all line breaks
+	for {
+		c, err := file.Read(buf)
+		if err == io.EOF {
+			break
+		} else if err != nil {
+			return count, err
+		}
+		count += bytes.Count(buf[:c], []byte{'\n'})
+	}
+	return count, nil
+}
 
 // Load data from database to in-memory map
 func ScanDatabase() error {
@@ -42,10 +110,112 @@ func ScanDatabase() error {
 	return nil
 }
 
+// Reads from WAL log and updates database from last checkpoint
+// Runs every 5 seconds
+func UpdateDatabase() error {
+	// Load last checkpoint
+	checkpointBytes, err := os.ReadFile("checkpoint.txt")
+	if err != nil {
+		return err
+	}
+	checkpointString := string(checkpointBytes)
+	checkpoint, err := strconv.Atoi(checkpointString)
+	if err != nil {
+		return err
+	}
+
+	// Open log file and save lines after checkpoint to array
+	mutex.RLock()
+	file, err := os.Open("wal.log")
+	if err != nil {
+		mutex.RUnlock()
+		return err
+	}
+
+	var lines []string
+	scanner := bufio.NewScanner(file)
+	lineCount := 1
+	for scanner.Scan() {
+		if lineCount <= checkpoint { // ignore lines before checkpoint
+			lineCount++
+			continue
+		}
+		lineString := scanner.Text()
+		lines = append(lines, lineString)
+	}
+	file.Close()
+	mutex.RUnlock()
+
+	// Iterate over each line and commit to database
+	for _, lineString := range lines {
+		line := strings.Split(lineString, ",")
+
+		err := db.Update(func(txn *badger.Txn) error {
+			if line[1] == "SET" {
+				if err := txn.Set([]byte(line[2]), []byte(line[3])); err != nil {
+					return err
+				}
+
+			} else if line[1] == "DELETE" {
+				if err := txn.Delete([]byte(line[2])); err != nil {
+					return err
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	// Make new checkpoint from log file
+	checkpoint, err = LoadLSN()
+	if err != nil {
+		return err
+	}
+	checkpointString = fmt.Sprintf("%d", checkpoint)
+
+	// Save new checkpoint
+	if err := os.WriteFile("checkpoint.txt", []byte(checkpointString), 0600); err != nil {
+		return err
+	}
+	return nil
+}
+
+// Write to log file
+func UpdateLog(operation string, key string, value string) error {
+	// Open log file
+	file, err := os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return err
+	}
+	defer file.Close()
+
+	// Format log entry
+	var newLog string
+	if operation == "SET" {
+		newLog = fmt.Sprintf("%d,%s,%s,%s\n", lsn, operation, key, value)
+	} else if operation == "DELETE" {
+		newLog = fmt.Sprintf("%d,%s,%s\n", lsn, operation, key)
+	} else {
+		return errors.New("Invalid operation to WAL log - " + operation)
+	}
+
+	// Write to log file
+	_, err = file.WriteString(newLog)
+	if err != nil {
+		log.Println("Could not write to WAL log - ", err)
+		return err
+	}
+
+	lsn++ // update log file counter
+	return nil
+}
+
 // Helper function for returning HTTP response
 func WriteResponse(w http.ResponseWriter, statusCode int, message string) {
 	w.Header().Set("Content-type", "Application/json") // JSON response
-	w.WriteHeader(statusCode) // add HTTP status code
+	w.WriteHeader(statusCode)                          // add HTTP status code
 
 	// Format JSON and add it to response body
 	resp := make(map[string]string)
@@ -63,7 +233,7 @@ func GetRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Extract Query Parameter
 	KeyQuery := r.URL.Query()["key"]
-	if len(KeyQuery)==0 {
+	if len(KeyQuery) == 0 {
 		WriteResponse(w, 404, "Key not found")
 		return
 	}
@@ -95,7 +265,7 @@ func SetRequest(w http.ResponseWriter, r *http.Request) {
 	// Extract Query Parameters
 	KeyQuery := r.URL.Query()["key"]
 	ValueQuery := r.URL.Query()["value"]
-	if len(KeyQuery) == 0  {
+	if len(KeyQuery) == 0 {
 		WriteResponse(w, 404, "Key not found")
 		return
 	} else if len(ValueQuery) == 0 {
@@ -116,17 +286,14 @@ func SetRequest(w http.ResponseWriter, r *http.Request) {
 
 	// Save to map and database
 	mutex.Lock()
-	
+
 	mp[key] = value
-	err := db.Update(func(txn *badger.Txn) error {
-		if err := txn.Set([]byte(key), []byte(value)); err != nil {
-			return err
-		}
-		return nil
-	})
+	err := UpdateLog("SET", key, value)
+
 	if err != nil {
-		log.Println("Error saving to database - ", err)
+		log.Println("Error writing to log - ", err)
 		WriteResponse(w, 400, "Internal Server Error")
+		defer os.Exit(1) // quit if WAL is not working
 	} else {
 		WriteResponse(w, 200, "Key saved")
 	}
@@ -147,22 +314,19 @@ func DeleteRequest(w http.ResponseWriter, r *http.Request) {
 		WriteResponse(w, 404, "Key not found")
 		return
 	}
-	
+
 	// Extract key
 	key := KeyQuery[0]
 
 	// Delete key-value from map and database
 	mutex.Lock()
 	delete(mp, key)
-	err := db.Update(func(txn *badger.Txn) error {
-		if err := txn.Delete([]byte(key)); err != nil {
-			return err
-		}
-		return nil
-	})
+	err := UpdateLog("DELETE", key, "")
+
 	if err != nil {
-		log.Println("Error deleting from database - ", err)
+		log.Println("Error writing to log - ", err)
 		WriteResponse(w, 400, "Internal Server Error")
+		defer os.Exit(1) // quit if WAL is not working
 	} else {
 		WriteResponse(w, 200, "Key deleted")
 	}
@@ -170,6 +334,11 @@ func DeleteRequest(w http.ResponseWriter, r *http.Request) {
 }
 
 func main() {
+	// Check if all required files exist
+	if !ValidateFiles() {
+		log.Fatal("Necessary files don't exist, Exiting")
+	}
+
 	// Start database connection
 	var err error
 	db, err = badger.Open(badger.DefaultOptions("./db"))
@@ -184,6 +353,24 @@ func main() {
 	if err := ScanDatabase(); err != nil {
 		log.Fatal("Error loading data from database - ", err)
 	}
+
+	lsn, err = LoadLSN()
+	if err != nil {
+		log.Fatal("Could not load LSN")
+	}
+	lsn++
+
+	// Update database every 5 seconds
+	go func() {
+		for {
+			time.Sleep(time.Second * 5)
+			log.Println("Running update database goroutine")
+			err = UpdateDatabase()
+			if err != nil {
+				log.Fatal("Error saving to database - ", err)
+			}
+		}
+	}()
 
 	// Define port on which server will run
 	PORT := ":8080"

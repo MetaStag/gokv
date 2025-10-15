@@ -1,1 +1,3 @@
 db
+wal.log
+checkpoint.txt
