@@ -1,3 +1,4 @@
 db
 wal.log
 checkpoint.txt
+cluster.txt

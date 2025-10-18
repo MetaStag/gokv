@@ -19,10 +19,12 @@ import (
 )
 
 var (
-	db    *badger.DB        // database object
-	lsn   int               // keep track of log file entries
+	db    *badger.DB        // Database object
+	c     *http.Client      // HTTP Client to talk to other nodes
+	nodes []string          // List of connected nodes
+	lsn   int               // Keep track of log file entries
 	mp    map[string]string // In-memory map for fast access
-	mutex sync.RWMutex      // manage access to shared resources
+	mutex sync.RWMutex      // Manage access to shared resources
 )
 
 // Check if important file/folders exist, if not then create them
@@ -208,6 +210,18 @@ func UpdateLog(operation string, key string, value string) error {
 		return err
 	}
 
+	// Propagate change to other nodes
+	bodyFormat := fmt.Sprintf("{update: %s}", newLog)
+	body := strings.NewReader(bodyFormat)
+
+	for _, v := range nodes {
+		resp, err := c.Post(v+"/internal/update", "application/json", body)
+		if err != nil {
+			log.Println("Could not send changes to node - ", err)
+		}
+		resp.Body.Close()
+	}
+
 	lsn++ // update log file counter
 	return nil
 }
@@ -221,6 +235,81 @@ func WriteResponse(w http.ResponseWriter, statusCode int, message string) {
 	resp := make(map[string]string)
 	resp["message"] = message
 	json.NewEncoder(w).Encode(resp)
+}
+
+// Check health of node
+func HealthCheck(w http.ResponseWriter, r *http.Request) {
+	WriteResponse(w, 200, "OK")
+}
+
+// Run this function initially to connect to other nodes
+// It finds the IP of other nodes from cluster.txt
+func ConnectNodes() error {
+	// Load data from cluster.txt
+	data, err := os.ReadFile("cluster.txt")
+	if err != nil {
+		return err
+	}
+
+	// Update nodes[]
+	lines := bytes.Lines(data)
+	for i := range lines {
+		nodes = append(nodes, string(i))
+	}
+	return nil
+}
+
+// Ping other nodes to check if connection is alive
+// Updates nodes[] if a connection breaks
+func Ping() error {
+	var newNodes []string
+	for _, v := range nodes {
+		resp, err := c.Get(v + "/ping")
+		if err != nil || resp.Status != "200 OK" {
+			continue
+		} else {
+			newNodes = append(newNodes, v)
+		}
+	}
+	nodes = newNodes
+	return nil
+}
+
+// Recieve and mark WAL updates from other nodes
+func InternalUpdateRequest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != "POST" {
+		WriteResponse(w, 400, "Invalid HTTP Method")
+		return
+	}
+
+	// Read request body
+	b := make([]byte, 32)
+	_, err := r.Body.Read(b)
+	if err != nil {
+		log.Println("Could not read POST body - ", err)
+		WriteResponse(w, 400, "Invalid request body")
+		return
+	}
+	newLog := string(b)
+
+	mutex.Lock()
+	defer mutex.Unlock()
+
+	// Open log file
+	file, err := os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		log.Println("Could not write to WAL log - ", err)
+		WriteResponse(w, 400, "Internal Server Error")
+		return
+	}
+	defer file.Close()
+
+	// Write to log file
+	_, err = file.WriteString(newLog)
+	if err != nil {
+		log.Println("Could not write to WAL log - ", err)
+		WriteResponse(w, 400, "Internal Server Error")
+	}
 }
 
 // Fetch value from key
@@ -354,6 +443,7 @@ func main() {
 		log.Fatal("Error loading data from database - ", err)
 	}
 
+	// Load last checkpoint
 	lsn, err = LoadLSN()
 	if err != nil {
 		log.Fatal("Could not load LSN")
@@ -364,10 +454,29 @@ func main() {
 	go func() {
 		for {
 			time.Sleep(time.Second * 5)
-			log.Println("Running update database goroutine")
+			log.Println("Running update database goroutine") // for debugging, remove later
 			err = UpdateDatabase()
 			if err != nil {
 				log.Fatal("Error saving to database - ", err)
+			}
+		}
+	}()
+
+	// Connect to other nodes
+	err = ConnectNodes()
+	if err != nil {
+		log.Fatal("Could not connect to other nodes")
+	}
+
+	// Periodically ping nodes to check if connection is alive
+	c = &http.Client{}
+	go func() {
+		for {
+			time.Sleep(time.Minute * 2)
+			log.Println("Running ping goroutine") // for debugging, remove later
+			err := Ping()
+			if err != nil {
+				log.Fatal("Error pinging other nodes, - ", err)
 			}
 		}
 	}()
@@ -376,9 +485,11 @@ func main() {
 	PORT := ":8080"
 
 	// Define Routes
+	http.HandleFunc("/ping", HealthCheck)
 	http.HandleFunc("/get", GetRequest)
 	http.HandleFunc("/set", SetRequest)
 	http.HandleFunc("/delete", DeleteRequest)
+	http.HandleFunc("/internal/update", InternalUpdateRequest)
 
 	// Start Server
 	log.Printf("Server running on http://localhost%s\n", PORT)
