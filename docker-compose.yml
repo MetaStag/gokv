@@ -1,0 +1,13 @@
+services:
+  c1:
+    image: gokv
+    environment:
+      - CNAME=c1
+    ports:
+      - "8080:8080"
+  c2:
+    image: gokv
+    environment:
+      - CNAME=c2
+    ports:
+      - "8081:8080"
