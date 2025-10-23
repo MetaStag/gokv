@@ -1,22 +1,23 @@
+![](https://raw.githubusercontent.com/egonelbre/gophers/master/.thumb/vector/fairy-tale/witch-learning.png)
+
+
 ### gokv
 
 a distributed key-value api written in golang
 
-database used: [badger]("github.com/dgraph-io/badger/v4")
-
-(note: project is currently broken - network/storage module are not in sync, next commit will fix it)
+database used: [badger](https://github.com/hypermodeinc/badger)
 
 ---
 
 #### Key-Value API
 
-This project implements a simple key-value api with support for distributed nodes.
-- A simple HTTP API is exposed with 3 endpoints for managing key-value pairs.
-- The backend runs on multiple nodes, each with their own copy of the database for fault tolerance.
+This project implements a simple key-value api with support for distributed nodes
+- A simple HTTP API is exposed with 3 endpoints for managing key-value pairs
+- The backend runs on multiple nodes, each with their own copy of the database for fault tolerance
 - Docker containers are used to simulate nodes
 - Nodes connect to each other via HTTP requests
 - A Leader-Follower system is implemented using Raft Consensus (under development)
-- It prefers Strong Consistency by propagating each change immediately
+- Linearizability will be implemented for consistency
 - It uses a Write-Ahead Log (WAL) for durability
 
 #### Setup Instructions
