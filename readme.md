@@ -16,8 +16,7 @@ This project implements a simple key-value api with support for distributed node
 - The backend runs on multiple nodes, each with their own copy of the database for fault tolerance
 - Docker containers are used to simulate nodes
 - Nodes connect to each other via HTTP requests
-- A Leader-Follower system is implemented using Raft Consensus (under development)
-- Linearizability will be implemented for consistency
+- A simple commit algorithm is implemented where each change is propagated to every other node (not practical for real use)
 - It uses a Write-Ahead Log (WAL) for durability
 
 #### Setup Instructions
